@@ -15,7 +15,7 @@
 2. **Link the client** (tricks Ethersync into using our client)
    ```bash
    chmod +x ./client.js
-   sudo ln -sf ./client.js /usr/local/bin/ethersync
+   sudo ln -sf "$(pwd)/client.js" /usr/local/bin/ethersync
    ```
 
 3. **Start server**
