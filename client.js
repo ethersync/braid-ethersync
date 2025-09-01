@@ -29,11 +29,11 @@ class EthersyncProxy {
     // Establish SSE connection to receive messages from server
     this.connectSSE();
 
-    console.error('Ethersync proxy started, connecting to http://localhost:1009');
+    console.error('Ethersync proxy started, connecting to http://localhost:2009');
   }
 
   connectSSE() {
-    this.sseConnection = new EventSource('http://localhost:1009/events');
+    this.sseConnection = new EventSource('http://localhost:2009/events');
     
     this.sseConnection.onmessage = (event) => {
       try {
@@ -94,7 +94,7 @@ class EthersyncProxy {
     
     const options = {
       hostname: 'localhost',
-      port: 1009,
+      port: 2009,
       path: '/rpc',
       method: 'POST',
       headers: {

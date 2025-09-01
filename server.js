@@ -37,8 +37,8 @@ function EthersyncServer() {
         }
       });
 
-      server.listen(1009, () => {
-        console.error('Ethersync server listening on http://localhost:1009');
+      server.listen(2009, () => {
+        console.error('Ethersync server listening on http://localhost:2009');
       });
     },
 
