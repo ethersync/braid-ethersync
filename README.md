@@ -30,4 +30,4 @@
    code shared/zz
    ```
 
-6. **Verify sync** with https://dt.braid.org/zz
+6. **Verify sync** with https://braid.org/apps/ethersync
