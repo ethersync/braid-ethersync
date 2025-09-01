@@ -280,18 +280,35 @@ function simpleton_client(url, {
                     p.content = p.content_text
                 }
 
-                var delta = patches.map(p => ({
-                    range: {
-                        start: offset_to_line_char(p.range[0], unconfirmed_text),
-                        end: offset_to_line_char(p.range[1], unconfirmed_text),
-                    },
-                    replacement: p.content
-                }))
+                // hack: deal with patches one at a time..
+                patches = absolute_to_relative_patches(patches)
+                for (var p of patches) {
+                    var delta = [{
+                        range: {
+                            start: offset_to_line_char(p.range[0], unconfirmed_text),
+                            end: offset_to_line_char(p.range[1], unconfirmed_text),
+                        },
+                        replacement: p.content
+                    }]
 
-                unconfirmed_updates.push({ version, patches })
-                unconfirmed_text = apply_patches(unconfirmed_text, patches)
+                    unconfirmed_updates.push({ version, patches: [p] })
+                    unconfirmed_text = apply_patches(unconfirmed_text, [p])
 
-                on_delta(delta)
+                    on_delta(delta)
+                }
+
+                // var delta = patches.map(p => ({
+                //     range: {
+                //         start: offset_to_line_char(p.range[0], unconfirmed_text),
+                //         end: offset_to_line_char(p.range[1], unconfirmed_text),
+                //     },
+                //     replacement: p.content
+                // }))
+
+                // unconfirmed_updates.push({ version, patches })
+                // unconfirmed_text = apply_patches(unconfirmed_text, patches)
+
+                // on_delta(delta)
             }
         }, on_error)
     }).catch(on_error)
