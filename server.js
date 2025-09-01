@@ -1,9 +1,8 @@
 
 var braid_fetch = require('braid-http').fetch
 
-eval(require('fs').readFileSync(`${__dirname}/node_modules/braid-text/simpleton-client.js`, 'utf8'))
-
-var url = 'https://dt.braid.org/zz'
+// var url = 'https://dt.braid.org/zz'
+var url = 'https://braid.org/apps/ethersync'
 
 // Main execution
 const server = new EthersyncServer();
@@ -82,7 +81,9 @@ function EthersyncServer() {
       req.on('end', () => {
         try {
           const message = JSON.parse(body);
-          console.error('Received RPC:', JSON.stringify(message, null, 2));
+
+          if (message.method !== 'cursor')
+            console.error('Received RPC:', JSON.stringify(message, null, 2));
           
           // Process the message
           if (message.method === 'open') {
@@ -108,12 +109,15 @@ function EthersyncServer() {
     handleOpen(message) {
       var { uri, content } = message.params;
 
-      content = ''
+      // safety check for now
+      if (!uri.endsWith('/zz')) {
+        throw new Error('invalid file for now')
+      }
       
       // Initialize file state
       const fileState = {
-        content: content,
         editorRevision: 0,
+        last_seen_revision: 0,
         braidClient: null
       };
 
@@ -121,45 +125,14 @@ function EthersyncServer() {
 
       // Create simpleton client connection to braid.org
       const braidClient = simpleton_client(url, {
-        get_state: () => {
-          return this.openFiles.get(uri)?.content || '';
-        },
-        
-        on_patches: (patches) => {
-          console.error('Received patches from braid:', patches);
+
+        // for braid.org/apps/ethersync,
+        // we need content-type text/plain
+        content_type: 'text/plain',
+
+        on_delta: (delta) => {
           const currentState = this.openFiles.get(uri);
           if (!currentState) return;
-
-          // Convert patches to line/char format and broadcast to SSE clients
-          const convertedDeltas = patches.map(patch => {
-            const startLineChar = offsetToLineChar(currentState.content, patch.range[0]);
-            const endLineChar = offsetToLineChar(currentState.content, patch.range[1]);
-            
-            return {
-              range: {
-                start: startLineChar,
-                end: endLineChar
-              },
-              replacement: patch.content
-            };
-          });
-
-          // Apply patches to our content
-          let newContent = currentState.content;
-          let offset = 0;
-          
-          for (const patch of patches) {
-            const startPos = patch.range[0] + offset;
-            const endPos = patch.range[1] + offset;
-            newContent = newContent.substring(0, startPos) + 
-                        patch.content + 
-                        newContent.substring(endPos);
-            offset += patch.content.length - (patch.range[1] - patch.range[0]);
-          }
-          
-          // Update our state
-          currentState.content = newContent;
-
           // Send edit notification via SSE
           const edit = {
             jsonrpc: '2.0',
@@ -167,17 +140,11 @@ function EthersyncServer() {
             params: {
               uri: uri,
               revision: currentState.editorRevision,
-              delta: convertedDeltas
+              delta
             }
           };
-
           this.broadcastMessage(edit);
-          console.error(`Broadcasted edit from braid to ${uri}`);
         },
-        
-        on_error: (error) => {
-          console.error('Braid client error:', error);
-        }
       });
 
       fileState.braidClient = braidClient;
@@ -200,13 +167,14 @@ function EthersyncServer() {
           revision: fileState.editorRevision,
           delta: [{
             range: {
-              start: offsetToLineChar(initial_content, 0),
-              end: offsetToLineChar(initial_content, initial_content.length)
+              start: offset_to_line_char(0, initial_content),
+              end: offset_to_line_char(initial_content.length, initial_content)
             },
             replacement: ''
           }]
         }
       });
+      fileState.last_seen_revision = 1
 
       console.error(`Opened file: ${uri}, connected to braid`);
     },
@@ -237,43 +205,13 @@ function EthersyncServer() {
       const { uri, revision, delta } = message.params;
       
       const fileState = this.openFiles.get(uri);
-      if (!fileState) {
-        console.error(`Edit received for unknown file: ${uri}`);
-        return;
-      }
-
+      if (!fileState) throw new Error(`Edit received for unknown file: ${uri}`)
       console.error(`Editor edit received for ${uri}, revision ${revision}`);
 
-      // Apply edits to our local content and forward to braid
-      let newContent = fileState.content;
-      
-      // Sort deltas by position (descending) to apply them without position conflicts
-      const sortedDeltas = [...delta].sort((a, b) => {
-        const aStart = lineCharToOffset(newContent, a.range.start.line, a.range.start.character);
-        const bStart = lineCharToOffset(newContent, b.range.start.line, b.range.start.character);
-        return bStart - aStart; // descending order
-      });
-
-      // Apply each delta to our content
-      for (const deltaItem of sortedDeltas) {
-        const startOffset = lineCharToOffset(newContent, deltaItem.range.start.line, deltaItem.range.start.character);
-        const endOffset = lineCharToOffset(newContent, deltaItem.range.end.line, deltaItem.range.end.character);
-        
-        newContent = newContent.substring(0, startOffset) + 
-                    deltaItem.replacement + 
-                    newContent.substring(endOffset);
-      }
-
-      // Update our state
-      fileState.content = newContent;
+      if (revision < fileState.last_seen_revision) throw new Error('user edited too soon')
+      fileState.braidClient.changed(revision - fileState.last_seen_revision, delta)
+      fileState.last_seen_revision = revision
       fileState.editorRevision++;
-
-      // Notify braid client of the change
-      if (fileState.braidClient && fileState.braidClient.changed) {
-        fileState.braidClient.changed().catch(error => {
-          console.error('Error sending change to braid:', error);
-        });
-      }
 
       // Send success response
       this.broadcastMessage({
@@ -301,48 +239,523 @@ function EthersyncServer() {
   })
 }
 
-// Utility functions
+function simpleton_client(url, {
+    on_delta,
+    content_type,
+    on_error,
+}) {
+    var peer = Math.random().toString(36).slice(2)
+    var current_version = []
+    var current_text = ''
+    var current_patches = []
+    var char_counter = -1
+    var outstanding_changes = 0
+    var max_outstanding_changes = 10
+    var ac = new AbortController()
 
-// Convert line/character position to global offset
-function lineCharToOffset(content, line, character) {
-  const lines = content.split('\n');
-  let offset = 0;
-  
-  // Add lengths of all previous lines (including newline characters)
-  for (let i = 0; i < line && i < lines.length; i++) {
-    offset += lines[i].length + 1; // +1 for newline
-  }
-  
-  // Add character offset within the target line
-  if (line < lines.length) {
-    offset += Math.min(character, lines[line].length);
-  }
-  
-  return offset;
+    var unconfirmed_updates = []
+    var unconfirmed_text = current_text
+
+    braid_fetch(url, {
+        headers: { "Merge-Type": "simpleton",
+            ...(content_type ? {Accept: content_type} : {}) },
+        subscribe: true,
+        retry: () => true,
+        parents: () => current_version.length ? current_version : null,
+        peer,
+        signal: ac.signal
+    }).then(res => {
+        res.subscribe(async update => {
+            if (!current_patches.length &&
+                arrays_equal(update.parents.sort(),
+                    unconfirmed_updates.at(-1)?.version ||
+                    current_version)) {
+
+                var version = update.version.sort()
+
+                var patches = update.patches ||
+                    [{range: [0, 0], content: update.body_text}]
+                if (update.patches) for (let p of patches) {
+                    p.range = p.range.match(/\d+/g).map((x) => 1 * x)
+                    p.content = p.content_text
+                }
+
+                var delta = patches.map(p => ({
+                    range: {
+                        start: offset_to_line_char(p.range[0], unconfirmed_text),
+                        end: offset_to_line_char(p.range[1], unconfirmed_text),
+                    },
+                    replacement: p.content
+                }))
+
+                unconfirmed_updates.push({ version, patches })
+                unconfirmed_text = apply_patches(unconfirmed_text, patches)
+
+                on_delta(delta)
+            }
+        }, on_error)
+    }).catch(on_error)
+    
+    return {
+      stop: async () => {
+        ac.abort()
+      },
+      changed: async (num_confirmed_updates, delta) => {
+        // get up to speed from unconfirmed updates..
+        for (var u of unconfirmed_updates.slice(0, num_confirmed_updates)) {
+          current_version = u.version
+          current_text = apply_patches(current_text, u.patches)
+        }
+        unconfirmed_updates = []
+
+        // apply this latest delta..
+        var patches = delta.map(d => ({
+            range: [
+                line_char_to_offset(d.range.start, current_text),
+                line_char_to_offset(d.range.end, current_text)
+            ],
+            content: d.replacement
+        })).sort((a, b) => a.range[0] - b.range[0])
+
+        current_text = apply_patches(current_text, patches)
+        unconfirmed_text = current_text
+
+        current_patches = relative_to_absolute_patches(
+          absolute_to_relative_patches(current_patches).concat(
+            absolute_to_relative_patches(patches)))
+
+        if (outstanding_changes >= max_outstanding_changes) return
+        while (true) {
+            if (!current_patches.length) return
+            patches = current_patches
+            current_patches = []
+
+            char_counter += patches.reduce((a, b) =>
+              a + (b.range[1] - b.range[0]) + count_code_points(b.content), 0)
+
+            var version = [peer + "-" + char_counter]
+            var parents = current_version
+            current_version = version
+            
+            for (var p of patches) {
+              p.unit = 'text'
+              p.range = `[${p.range.join(':')}]`
+            }
+
+            outstanding_changes++
+            try {
+                var r = await braid_fetch(url, {
+                    headers: {
+                        "Merge-Type": "simpleton",
+                        ...(content_type ? {"Content-Type": content_type} : {})
+                    },
+                    method: "PUT",
+                    retry: (res) => res.status !== 550,
+                    version, parents, patches,
+                    peer
+                })
+                if (!r.ok) throw new Error(`bad http status: ${r.status}${(r.status === 401 || r.status === 403) ? ` (access denied)` : ''}`)
+            } catch (e) {
+                on_error(e)
+                throw e
+            }
+            outstanding_changes--
+        }
+      }
+    }
 }
 
-// Convert global offset to line/character position
-function offsetToLineChar(content, offset) {
-  const lines = content.split('\n');
-  let currentOffset = 0;
-  
-  for (let line = 0; line < lines.length; line++) {
-    const lineLength = lines[line].length;
-    const lineEndOffset = currentOffset + lineLength;
+// Utility functions
+
+function line_char_to_offset({line, character}, context) {
+    var currentLine = 0
+    var currentLineStart = 0
+    var codePointIndex = 0
+    var i = 0
+
+    while (true) {
+        if (currentLine === line &&
+            codePointIndex - currentLineStart === character)
+            return codePointIndex
+
+        if (i >= context.length) new Error(`Line ${line}, character ${character} is beyond the text`)
+
+        var char = context[i]
+
+        codePointIndex++
+        if (char === "\r" || char === "\n") {
+            if (char === "\r" && i + 1 < context.length && context[i + 1] === "\n") {
+                i++
+                codePointIndex++
+            }
+            currentLine++
+            currentLineStart = codePointIndex
+        } else {
+            var codeUnit = context.charCodeAt(i)
+            if (codeUnit >= 0xd800 && codeUnit <= 0xdbff && i + 1 < context.length) {
+                var nextCodeUnit = context.charCodeAt(i + 1)
+                if (nextCodeUnit >= 0xdc00 && nextCodeUnit <= 0xdfff) {
+                    // Surrogate pair - single code point
+                    i += 2
+                    continue
+                }
+            }
+        }
+        i++
+    }
+}
+
+function offset_to_line_char(offset, context) {
+    offset_to_line_char.was_between_crlf = false
+
+    let currentLine = 0
+    let currentLineStart = 0
+    let codePointIndex = 0
+    let i = 0
+
+    while (true) {
+        if (codePointIndex === offset)
+            return {
+                line: currentLine,
+                character: codePointIndex - currentLineStart,
+            }
+        
+        if (i >= context.length) throw new Error(`Offset ${offset} is beyond the string length (${codePointIndex} code points)`)
+
+        const char = context[i]
+
+        codePointIndex++
+        if (char === "\r" || char === "\n") {
+            if (char === "\r" && i + 1 < context.length && context[i + 1] === "\n") {
+                // \r\n sequence - check if offset falls between them
+                if (codePointIndex === offset) {
+                    offset_to_line_char.was_between_crlf = true
+                    return {
+                        line: currentLine,
+                        character: codePointIndex - currentLineStart - 1,
+                    }
+                }
+                i++
+                codePointIndex++
+            }
+            currentLine++
+            currentLineStart = codePointIndex
+        } else {
+            const codeUnit = context.charCodeAt(i)
+            if (codeUnit >= 0xd800 && codeUnit <= 0xdbff && i + 1 < context.length) {
+                const nextCodeUnit = context.charCodeAt(i + 1)
+                if (nextCodeUnit >= 0xdc00 && nextCodeUnit <= 0xdfff) {
+                    i += 2
+                    continue
+                }
+            }
+        }
+        i++
+    }
+}
+
+function arrays_equal(a, b) {
+  return a.length === b.length && a.every((v, i) => v === b[i])
+}
+
+function apply_patches(s, patches) {
+    // Sort patches by start position in descending order
+    // This ensures we apply from right to left, avoiding position shifts
+    for (let p of [...patches].sort((a, b) => b.range[0] - a.range[0]))
+        s = s.slice(0, codePoints_to_index(s, p.range[0])) +
+            p.content +
+            s.slice(codePoints_to_index(s, p.range[1]))
+    return s
+}
+
+function relative_to_absolute_patches(patches) {
+    let avl = create_avl_tree((node) => {
+        let parent = node.parent
+        if (parent.left == node) {
+            parent.left_size -= node.left_size + node.size
+        } else {
+            node.left_size += parent.left_size + parent.size
+        }
+    })
+    avl.root.size = Infinity
+    avl.root.left_size = 0
+
+    function resize(node, new_size) {
+        if (node.size == new_size) return
+        let delta = new_size - node.size
+        node.size = new_size
+        while (node.parent) {
+            if (node.parent.left == node) node.parent.left_size += delta
+            node = node.parent
+        }
+    }
+
+    for (let p of patches) {
+        let [start, end] = p.range
+        let del = end - start
+
+        let node = avl.root
+        while (true) {
+            if (start < node.left_size || (node.left && node.content == null && start == node.left_size)) {
+                node = node.left
+            } else if (start > node.left_size + node.size || (node.content == null && start == node.left_size + node.size)) {
+                start -= node.left_size + node.size
+                node = node.right
+            } else {
+                start -= node.left_size
+                break
+            }
+        }
+
+        let remaining = start + del - node.size
+        if (remaining < 0) {
+            if (node.content == null) {
+                if (start > 0) {
+                    let x = { size: 0, left_size: 0 }
+                    avl.add(node, "left", x)
+                    resize(x, start)
+                }
+                let x = { size: 0, left_size: 0, content: p.content, del }
+                avl.add(node, "left", x)
+                resize(x, count_code_points(x.content))
+                resize(node, node.size - (start + del))
+            } else {
+                node.content = node.content.slice(0, codePoints_to_index(node.content, start)) + p.content + node.content.slice(codePoints_to_index(node.content, start + del))
+                resize(node, count_code_points(node.content))
+            }
+        } else {
+            let next
+            let middle_del = 0
+            while (remaining >= (next = avl.next(node)).size) {
+                remaining -= next.size
+                middle_del += next.del ?? next.size
+                resize(next, 0)
+                avl.del(next)
+            }
+
+            if (node.content == null) {
+                if (next.content == null) {
+                    if (start == 0) {
+                        node.content = p.content
+                        node.del = node.size + middle_del + remaining
+                        resize(node, count_code_points(node.content))
+                    } else {
+                        let x = {
+                            size: 0,
+                            left_size: 0,
+                            content: p.content,
+                            del: node.size - start + middle_del + remaining,
+                        }
+                        resize(node, start)
+                        avl.add(node, "right", x)
+                        resize(x, count_code_points(x.content))
+                    }
+                    resize(next, next.size - remaining)
+                } else {
+                    next.del += node.size - start + middle_del
+                    next.content = p.content + next.content.slice(codePoints_to_index(next.content, remaining))
+                    resize(node, start)
+                    if (node.size == 0) avl.del(node)
+                    resize(next, count_code_points(next.content))
+                }
+            } else {
+                if (next.content == null) {
+                    node.del += middle_del + remaining
+                    node.content = node.content.slice(0, codePoints_to_index(node.content, start)) + p.content
+                    resize(node, count_code_points(node.content))
+                    resize(next, next.size - remaining)
+                } else {
+                    node.del += middle_del + next.del
+                    node.content = node.content.slice(0, codePoints_to_index(node.content, start)) + p.content + next.content.slice(codePoints_to_index(next.content, remaining))
+                    resize(node, count_code_points(node.content))
+                    resize(next, 0)
+                    avl.del(next)
+                }
+            }
+        }
+    }
+
+    let new_patches = []
+    let offset = 0
+    let node = avl.root
+    while (node.left) node = node.left
+    while (node) {
+        if (node.content == null) {
+            offset += node.size
+        } else {
+            new_patches.push({
+                unit: patches[0].unit,
+                range: [offset, offset + node.del],
+                content: node.content,
+            })
+            offset += node.del
+        }
+
+        node = avl.next(node)
+    }
+    return new_patches
+}
+
+function create_avl_tree(on_rotate) {
+    let self = { root: { height: 1 } }
+
+    self.calc_height = (node) => {
+        node.height = 1 + Math.max(node.left?.height ?? 0, node.right?.height ?? 0)
+    }
+
+    self.rechild = (child, new_child) => {
+        if (child.parent) {
+            if (child.parent.left == child) {
+                child.parent.left = new_child
+            } else {
+                child.parent.right = new_child
+            }
+        } else {
+            self.root = new_child
+        }
+        if (new_child) new_child.parent = child.parent
+    }
+
+    self.rotate = (node) => {
+        on_rotate(node)
+
+        let parent = node.parent
+        let left = parent.right == node ? "left" : "right"
+        let right = parent.right == node ? "right" : "left"
+
+        parent[right] = node[left]
+        if (parent[right]) parent[right].parent = parent
+        self.calc_height(parent)
+
+        self.rechild(parent, node)
+        parent.parent = node
+
+        node[left] = parent
+    }
+
+    self.fix_avl = (node) => {
+        self.calc_height(node)
+        let diff = (node.right?.height ?? 0) - (node.left?.height ?? 0)
+        if (Math.abs(diff) >= 2) {
+            if (diff > 0) {
+                if ((node.right.left?.height ?? 0) > (node.right.right?.height ?? 0)) self.rotate(node.right.left)
+                self.rotate((node = node.right))
+            } else {
+                if ((node.left.right?.height ?? 0) > (node.left.left?.height ?? 0)) self.rotate(node.left.right)
+                self.rotate((node = node.left))
+            }
+            self.fix_avl(node)
+        } else if (node.parent) self.fix_avl(node.parent)
+    }
+
+    self.add = (node, side, add_me) => {
+        let other_side = side == "left" ? "right" : "left"
+        add_me.height = 1
+
+        if (node[side]) {
+            node = node[side]
+            while (node[other_side]) node = node[other_side]
+            node[other_side] = add_me
+        } else {
+            node[side] = add_me
+        }
+        add_me.parent = node
+        self.fix_avl(node)
+    }
+
+    self.del = (node) => {
+        if (node.left && node.right) {
+            let cursor = node.right
+            while (cursor.left) cursor = cursor.left
+            cursor.left = node.left
+
+            // breaks abstraction
+            cursor.left_size = node.left_size
+            let y = cursor
+            while (y.parent != node) {
+                y = y.parent
+                y.left_size -= cursor.size
+            }
+
+            node.left.parent = cursor
+            if (cursor == node.right) {
+                self.rechild(node, cursor)
+                self.fix_avl(cursor)
+            } else {
+                let x = cursor.parent
+                self.rechild(cursor, cursor.right)
+                cursor.right = node.right
+                node.right.parent = cursor
+                self.rechild(node, cursor)
+                self.fix_avl(x)
+            }
+        } else {
+            self.rechild(node, node.left || node.right || null)
+            if (node.parent) self.fix_avl(node.parent)
+        }
+    }
+
+    self.next = (node) => {
+        if (node.right) {
+            node = node.right
+            while (node.left) node = node.left
+            return node
+        } else {
+            while (node.parent && node.parent.right == node) node = node.parent
+            return node.parent
+        }
+    }
+
+    return self
+}
+
+function count_code_points(str) {
+    let code_points = 0;
+    for (let i = 0; i < str.length; i++) {
+        if (str.charCodeAt(i) >= 0xD800 && str.charCodeAt(i) <= 0xDBFF) i++;
+        code_points++;
+    }
+    return code_points;
+}
+
+function codePoints_to_index(str, codePoints) {
+    let i = 0;
+    let c = 0;
+    while (c < codePoints && i < str.length) {
+        const charCode = str.charCodeAt(i);
+        i += (charCode >= 0xd800 && charCode <= 0xdbff) ? 2 : 1;
+        c++;
+    }
+    return i;
+}
+
+function absolute_to_relative_patches(patches) {
+    // Sort patches by start position (guaranteed non-overlapping)
+    const sortedPatches = [...patches].sort((a, b) => {
+        return a.range[0] - b.range[0];
+    });
     
-    if (offset <= lineEndOffset) {
-      return {
-        line: line,
-        character: offset - currentOffset
-      };
+    const relativePatches = [];
+    let cumulativeOffset = 0;
+    
+    for (const patch of sortedPatches) {
+        const [start, end] = patch.range;
+        const deletedLength = end - start;
+        const insertedLength = count_code_points(patch.content);
+        
+        // Adjust positions based on cumulative offset from previous patches
+        const relativeStart = start - cumulativeOffset;
+        const relativeEnd = end - cumulativeOffset;
+        
+        relativePatches.push({
+            range: [relativeStart, relativeEnd],
+            content: patch.content
+        });
+        
+        // Update cumulative offset for next patches
+        // Offset = total inserted - total deleted
+        cumulativeOffset += deletedLength - insertedLength;
     }
     
-    currentOffset = lineEndOffset + 1; // +1 for newline
-  }
-  
-  // If offset is beyond content, return end position
-  return {
-    line: lines.length - 1,
-    character: lines[lines.length - 1].length
-  };
+    return relativePatches;
 }
